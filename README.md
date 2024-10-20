@@ -1,4 +1,4 @@
-# BentoCloud Benchmark Client
+# Benchmark Client
 
 ## Usage
 
@@ -13,7 +13,7 @@ huggingface-cli login
 Set environment variables for benchmarking
 
 ```bash
-export BASE_URL=<BentoCloud Service URL>
+export BASE_URL=<Chat Completions Service URL>
 export SYSTEM_PROMPT=1      // 1 or 0
 ```
 
