@@ -292,13 +292,13 @@ async def start_benchmark_session(args, user_def):
     response_times = []
     async with aiohttp.ClientSession() as session:
         async with session.get(user_def.ping_url()) as response:
-            assert response.status == 200
+            assert response.status in [200, 404]
         await asyncio.sleep(0.3)
 
         for _ in range(5):
             time_start = time.time()
             async with session.get(user_def.ping_url()) as response:
-                assert response.status == 200
+                assert response.status in [200, 404]
             response_times.append(time.time() - time_start)
             await asyncio.sleep(0.3)
     ping_latency = sum(response_times) / len(response_times)

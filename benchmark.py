@@ -13,7 +13,8 @@ except (TypeError, ValueError):
 
 print(f"max_tokens set to {max_tokens}")
 
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+MODEL = os.environ.get("MODEL", "NousResearch/Meta-Llama-3.1-8B-Instruct")
+tokenizer = AutoTokenizer.from_pretrained(MODEL)
 
 default_system_prompt = """You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.
 
@@ -28,7 +29,7 @@ if os.environ.get("SYSTEM_PROMPT") == "1":
 else:
     system_prompt = ""
 
-base_url = os.environ.get("BASE_URL", "http://localhost:3000")
+base_url = os.environ.get("BASE_URL", "http://localhost:8000")
 
 
 @functools.lru_cache(maxsize=8)
@@ -79,18 +80,22 @@ class UserDef(BaseUserDef):
 
         prompt = random.choice(cls.PROMPTS)
         headers = {"Content-Type": "application/json"}
-        url = f"{cls.BASE_URL}/generate"
+        url = f"{cls.BASE_URL}/v1/chat/completions"
         data = {
-            "prompt": prompt,
-            "system_prompt": system_prompt,  # this is important because there's a default system prompt
-            "max_tokens": max_tokens,
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": max_tokens
         }
         return url, headers, json.dumps(data)
 
     @staticmethod
     def parse_response(chunk: bytes):
         import json
-        text = chunk.decode("utf-8").strip()
+        data = chunk.decode("utf-8").strip()
+        text = json.loads(data)["choices"][0]['message']['content']
         return tokenizer.encode(text, add_special_tokens=False)
 
 
