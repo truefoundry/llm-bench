@@ -92,7 +92,6 @@ class OpenAIChatStreaming(BaseUserDef):
         headers = {"accept": "application/json", "content-type": "application/json"}
         url = f"{cls.BASE_URL}/v1/chat/completions"
         data = {
-            "model": MODEL.lower().replace("/", "-").replace(".", "-"),
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt["prompt"]},
