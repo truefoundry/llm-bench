@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import numpy as np
 import aiohttp
+import pickle
 import time
 import collections
 import contextlib
@@ -23,10 +24,10 @@ def print_aggregations(d):
 
     # Prepare data for quantile calculations
     head_latencies = [
-        lat for lats in d["response_head_latency_bucket"].values() for lat in lats
+        lat for lats in d["response_head_latency_bucket"].values() for lat in lats if lat > 0
     ]
     response_times = [
-        lat for lats in d["response_latency_bucket"].values() for lat in lats
+        lat for lats in d["response_latency_bucket"].values() for lat in lats if lat > 0
     ]
 
     # Calculate total tokens
@@ -34,22 +35,30 @@ def print_aggregations(d):
     total_input_tokens = sum(d["input_word_bucket"].values())
 
     # Calculate tokens per second per user
-    output_tokens_per_second_per_user = collections.defaultdict(float)
-    input_tokens_per_second_per_user = collections.defaultdict(float)
+    output_tokens_per_second_per_user = collections.defaultdict(list)
+    input_tokens_per_second_per_user = collections.defaultdict(list)
 
     for (user, time), tokens in d["response_word_bucket"].items():
         user_response_time = sum(d["response_latency_bucket"][(user, time)])
         if user_response_time > 0 and tokens:
-            output_tokens_per_second_per_user[user] += tokens / user_response_time
+            output_tokens_per_second_per_user[user] += [tokens / user_response_time]
 
     for (user, time), tokens in d["input_word_bucket"].items():
         user_head_latency = sum(d["response_head_latency_bucket"][(user, time)])
         if user_head_latency > 0 and tokens:
-            input_tokens_per_second_per_user[user] += tokens / user_head_latency
+            input_tokens_per_second_per_user[user] += [tokens / user_head_latency]
+    
+    avg_input_tokens_per_second_per_user = {}
+    for user in input_tokens_per_second_per_user:
+        avg_input_tokens_per_second_per_user[user] = sum(input_tokens_per_second_per_user[user])/len(input_tokens_per_second_per_user[user])
+
+    avg_output_tokens_per_second_per_user = {}
+    for user in output_tokens_per_second_per_user:
+        avg_output_tokens_per_second_per_user[user] = sum(output_tokens_per_second_per_user[user])/len(output_tokens_per_second_per_user[user])
 
     # Calculate total tokens per second (for all users)
     total_output_tokens_per_second = total_output_tokens / total_time
-    total_input_tokens_per_second = total_input_tokens / total_time
+    total_input_tokens_per_second = sum(avg_input_tokens_per_second_per_user.values())
 
     # Calculate input/output tokens per request (user)
     input_tokens_per_request = collections.defaultdict(list)
@@ -93,12 +102,12 @@ def print_aggregations(d):
 
     print("\nOutput Tokens/s per user:")
     for q in quantiles:
-        value = np.percentile(list(output_tokens_per_second_per_user.values()), q)
+        value = np.percentile(list(avg_output_tokens_per_second_per_user.values()), q)
         print(f"  q{q}: {value:.2f}")
 
     print("\nInput Tokens/s per user:")
     for q in quantiles:
-        value = np.percentile(list(input_tokens_per_second_per_user.values()), q)
+        value = np.percentile(list(avg_input_tokens_per_second_per_user.values()), q)
         print(f"  q{q}: {value:.2f}")
 
     print(f"\nTotal Output Tokens/s (all users): {total_output_tokens_per_second:.2f}")
@@ -212,11 +221,6 @@ class MetricsCollector:
                 if min(time_window, now - self.start_time) > 0
                 else 0
             )
-            avg_input_tokens_per_sec = (
-                total_input_tokens_last_window / min(time_window, now - self.start_time)
-                if min(time_window, now - self.start_time) > 0
-                else 0
-            )
             avg_output_tokens_per_sec = (
                 total_output_tokens_last_window
                 / min(time_window, now - self.start_time)
@@ -235,9 +239,6 @@ class MetricsCollector:
             )
             self.logging_function(
                 f"Avg Requests/s (last {time_window} sec): {avg_requests_per_sec:.3f}"
-            )
-            self.logging_function(
-                f"Avg Input Tokens/s (last {time_window} sec): {avg_input_tokens_per_sec:.3f}"
             )
             self.logging_function(
                 f"Avg Output Tokens/s (last {time_window} sec): {avg_output_tokens_per_sec:.3f}"
@@ -262,8 +263,6 @@ class MetricsCollector:
             "max_users": self.max_users,
             "ping_latency": self.ping_latency,
         }
-        import pickle
-
         with open("final_report.pkl", "wb") as f:
             pickle.dump(data_to_pickle, f)
 
@@ -328,8 +327,9 @@ class UserSpawner:
                                     first = True
                                     result = []
                                     async for data, end_of_http_chunk in response.content.iter_chunks():
-                                        result += self.user_def.parse_response(data)
-                                        if first:
+                                        output = self.user_def.parse_response(data)
+                                        result += output
+                                        if first and output:
                                             first = False
                                             self.data_collector.collect_response_head_latency(
                                                 time.time() - req_start,
