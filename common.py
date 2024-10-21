@@ -7,45 +7,161 @@ import time
 import collections
 import contextlib
 import math
-import functools
+
+
+def print_aggregations(d):
+    end_time = max([t for u, t in d["response_bucket"]])
+    total_time = end_time - d["start_time"]
+    print("Total Time:", total_time)
+    print("Total Users:", len(set([u for u, t in d["response_bucket"]])))
+
+    # Calculate total requests
+    total_requests = sum(d["response_bucket"].values())
+
+    # Calculate average requests per second
+    avg_requests_per_second = total_requests / total_time
+
+    # Prepare data for quantile calculations
+    head_latencies = [
+        lat for lats in d["response_head_latency_bucket"].values() for lat in lats
+    ]
+    response_times = [
+        lat for lats in d["response_latency_bucket"].values() for lat in lats
+    ]
+
+    # Calculate total tokens
+    total_output_tokens = sum(d["response_word_bucket"].values())
+    total_input_tokens = sum(d["input_word_bucket"].values())
+
+    # Calculate tokens per second per user
+    output_tokens_per_second_per_user = collections.defaultdict(float)
+    input_tokens_per_second_per_user = collections.defaultdict(float)
+
+    for (user, time), tokens in d["response_word_bucket"].items():
+        user_response_time = sum(d["response_latency_bucket"][(user, time)])
+        if user_response_time > 0 and tokens:
+            output_tokens_per_second_per_user[user] += tokens / user_response_time
+
+    for (user, time), tokens in d["input_word_bucket"].items():
+        user_head_latency = sum(d["response_head_latency_bucket"][(user, time)])
+        if user_head_latency > 0 and tokens:
+            input_tokens_per_second_per_user[user] += tokens / user_head_latency
+
+    # Calculate total tokens per second (for all users)
+    total_output_tokens_per_second = total_output_tokens / total_time
+    total_input_tokens_per_second = total_input_tokens / total_time
+
+    # Calculate input/output tokens per request (user)
+    input_tokens_per_request = collections.defaultdict(list)
+    output_tokens_per_request = collections.defaultdict(list)
+
+    for (user, time), tokens in d["input_word_bucket"].items():
+        if tokens:
+            input_tokens_per_request[user].append(tokens)
+
+    for (user, time), tokens in d["response_word_bucket"].items():
+        if tokens:
+            output_tokens_per_request[user].append(tokens)
+
+    input_tokens_per_request_flat = [
+        token
+        for user_tokens in input_tokens_per_request.values()
+        for token in user_tokens
+    ]
+    output_tokens_per_request_flat = [
+        token
+        for user_tokens in output_tokens_per_request.values()
+        for token in user_tokens
+    ]
+
+    # Define quantiles
+    quantiles = [0, 50, 90, 95, 99, 100]
+
+    # Print aggregations
+    print(f"Total requests: {total_requests}")
+    print(f"Average Request/s: {avg_requests_per_second:.2f}")
+
+    print("\nResponse Time to first token (head_latency):")
+    for q in quantiles:
+        value = np.percentile(head_latencies, q)
+        print(f"  q{q}: {value:.2f}s")
+
+    print("\nResponse Time:")
+    for q in quantiles:
+        value = np.percentile(response_times, q)
+        print(f"  q{q}: {value:.2f}s")
+
+    print("\nOutput Tokens/s per user:")
+    for q in quantiles:
+        value = np.percentile(list(output_tokens_per_second_per_user.values()), q)
+        print(f"  q{q}: {value:.2f}")
+
+    print("\nInput Tokens/s per user:")
+    for q in quantiles:
+        value = np.percentile(list(input_tokens_per_second_per_user.values()), q)
+        print(f"  q{q}: {value:.2f}")
+
+    print(f"\nTotal Output Tokens/s (all users): {total_output_tokens_per_second:.2f}")
+    print(f"Total Input Tokens/s (all users): {total_input_tokens_per_second:.2f}")
+
+    print("\nInput Tokens per request:")
+    for q in quantiles:
+        value = np.percentile(input_tokens_per_request_flat, q)
+        print(f"  q{q}: {value:.2f}")
+
+    print("\nOutput Tokens per request:")
+    for q in quantiles:
+        value = np.percentile(output_tokens_per_request_flat, q)
+        print(f"  q{q}: {value:.2f}")
+
+    print(f"\nTotal Output Tokens: {total_output_tokens}")
+    print(f"Total Input Tokens: {total_input_tokens}")
 
 
 class MetricsCollector:
-    def __init__(self, user_def, session_time=None, ping_latency=0.0):
+    def __init__(self, user_def, logging_function, session_time=None, ping_latency=0.0):
         self.start_time = math.floor(time.time())
         self.input_word_bucket = collections.defaultdict(int)
         self.response_word_bucket = collections.defaultdict(int)
         self.response_head_latency_bucket = collections.defaultdict(list)
         self.response_latency_bucket = collections.defaultdict(list)
+        self.requests_through_time_bucket = collections.defaultdict(int)
         self.on_going_requests = 0
         self.response_bucket = collections.defaultdict(int)
         self.total_requests = 0
         self.on_going_users = 0
         self.status_bucket = collections.defaultdict(int)
         self.user_def = user_def
+        self.max_users = 0
         self.session_time = session_time
         self.ping_latency = ping_latency
+        self.logging_function = logging_function
+        print("Logger: ", self.logging_function)
 
-    def collect_response_chunk(self, chunk: list, input_tokens: int = 0):
-        self.response_word_bucket[math.floor(time.time())] += len(chunk)
-        self.input_word_bucket[math.floor(time.time())] += input_tokens
+    def collect_response_chunk(
+        self, chunk: list, input_tokens: int, user_id: int, time_key: int
+    ):
+        self.response_word_bucket[user_id, time_key] += len(chunk)
+        self.input_word_bucket[user_id, time_key] += input_tokens
+        self.requests_through_time_bucket[user_id, time_key] += 1
+        self.max_users = max(self.max_users, user_id)
 
     def collect_response_status(self, status):
         self.status_bucket[status] += 1
 
-    def collect_response_head_latency(self, latency):
-        self.response_head_latency_bucket[math.floor(time.time())] += [
+    def collect_response_head_latency(self, latency, user_id, time_key):
+        self.response_head_latency_bucket[user_id, time_key] += [
             latency - self.ping_latency
         ]
 
     @contextlib.contextmanager
-    def collect_http_request(self):
+    def collect_http_request(self, user_id, time_key):
         start_time = time.time()
         self.on_going_requests += 1
         yield
         self.on_going_requests -= 1
-        self.response_bucket[math.floor(time.time())] += 1
-        self.response_latency_bucket[math.floor(time.time())] += [
+        self.response_bucket[user_id, time_key] += 1
+        self.response_latency_bucket[user_id, time_key] += [
             time.time() - start_time - self.ping_latency
         ]
 
@@ -55,93 +171,104 @@ class MetricsCollector:
         yield
         self.on_going_users -= 1
 
-    async def report_loop(self, time_window=5):
+    async def report_loop(self, time_window=60, report_time_window=5):
         """
         Each bucket is in 1s. This function will report the avg metrics in the past time_window seconds.
         """
         while True:
-            await asyncio.sleep(time_window)
+            await asyncio.sleep(report_time_window)
             now = math.floor(time.time())
-            print(f"Time: {now - self.start_time}")
-            print(f"Active Users: {self.on_going_users}")
-            print(
-                f"Request/s: {sum(self.response_bucket[i] for i in range(now - time_window, now)) / time_window}"
+
+            # Calculate average latency for requests in the time window
+            latencies = []
+            for (
+                user_id,
+                time_key,
+            ), latency_list in self.response_latency_bucket.items():
+                if time_key >= now - time_window:
+                    latencies.extend(latency_list)
+
+            avg_latency = np.mean(latencies) if latencies else 0  # Average latency
+
+            # Calculate metrics for the time window
+            requests_last_window = sum(
+                self.response_bucket[key]
+                for key in self.response_bucket.keys()
+                if key[1] >= now - time_window - avg_latency
             )
-            print(f"Total Requests: {self.total_requests}")
-            print(f"Active Requests: {self.on_going_requests}")
-            latency_bucket = [
-                j
-                for i in range(now - time_window, now)
-                for j in self.response_head_latency_bucket[i]
-            ]
-            if latency_bucket:
-                print(f"Response Head Latency: {np.mean(latency_bucket)}")
-            latency_bucket = [
-                j
-                for i in range(now - time_window, now)
-                for j in self.response_latency_bucket[i]
-            ]
-            if latency_bucket:
-                print(f"Response Latency: {np.mean(latency_bucket)}")
-            print(
-                f"Response Tokens/s: {sum(self.response_word_bucket[i] for i in range(now - time_window, now)) / time_window}"
+            total_input_tokens_last_window = sum(
+                self.input_word_bucket[key]
+                for key in self.input_word_bucket.keys()
+                if key[1] >= now - time_window - avg_latency
             )
-            print(
-                f"Input Tokens/s: {sum(self.input_word_bucket[i] for i in range(now - time_window, now)) / time_window}"
+            total_output_tokens_last_window = sum(
+                self.response_word_bucket[key]
+                for key in self.response_word_bucket.keys()
+                if key[1] >= now - time_window - avg_latency
             )
-            print(f"Status: {self.status_bucket}")
-            print()
+
+            avg_requests_per_sec = (
+                requests_last_window / min(time_window, now - self.start_time)
+                if min(time_window, now - self.start_time) > 0
+                else 0
+            )
+            avg_input_tokens_per_sec = (
+                total_input_tokens_last_window / min(time_window, now - self.start_time)
+                if min(time_window, now - self.start_time) > 0
+                else 0
+            )
+            avg_output_tokens_per_sec = (
+                total_output_tokens_last_window
+                / min(time_window, now - self.start_time)
+                if min(time_window, now - self.start_time) > 0
+                else 0
+            )
+
+            # Log the metrics
+            self.logging_function(f"Time: {now - self.start_time}")
+            self.logging_function(f"Active Users: {self.on_going_users}")
+            self.logging_function(f"Total Requests: {self.total_requests}")
+            self.logging_function(f"Active Requests: {self.on_going_requests}")
+            self.logging_function(f"Status: {dict(self.status_bucket)}")
+            self.logging_function(
+                f"Avg Latency (last {time_window} sec): {avg_latency:.3f}"
+            )
+            self.logging_function(
+                f"Avg Requests/s (last {time_window} sec): {avg_requests_per_sec:.3f}"
+            )
+            self.logging_function(
+                f"Avg Input Tokens/s (last {time_window} sec): {avg_input_tokens_per_sec:.3f}"
+            )
+            self.logging_function(
+                f"Avg Output Tokens/s (last {time_window} sec): {avg_output_tokens_per_sec:.3f}"
+            )
+            self.logging_function("")
 
             if self.session_time and now - self.start_time >= self.session_time:
                 self.report_final()
                 break
 
     def report_final(self):
+        data_to_pickle = {
+            "start_time": self.start_time,
+            "input_word_bucket": self.input_word_bucket,
+            "response_word_bucket": self.response_word_bucket,
+            "response_head_latency_bucket": self.response_head_latency_bucket,
+            "response_latency_bucket": self.response_latency_bucket,
+            "requests_through_time_bucket": self.requests_through_time_bucket,
+            "response_bucket": self.response_bucket,
+            "total_requests": self.total_requests,
+            "status_bucket": self.status_bucket,
+            "max_users": self.max_users,
+            "ping_latency": self.ping_latency,
+        }
+        import pickle
+
+        with open("final_report.pkl", "wb") as f:
+            pickle.dump(data_to_pickle, f)
+
         print("=================== Final Report ====================")
-        print(f"Total Requests: {self.total_requests}")
-        print(
-            f"Average Request/s: {self.total_requests / (time.time() - self.start_time)}"
-        )
-
-        head_latency_size = sum(len(i) for i in self.response_head_latency_bucket.values())
-        if head_latency_size:
-            head_latencies = [j for i in self.response_head_latency_bucket.values() for j in i]
-
-            print(
-                f"Average Response Head Latency: {sum(head_latencies) / head_latency_size}"
-            )
-            print(
-                f"Median Response Head Latency: {np.percentile(head_latencies, 50)}"
-            )
-            print(
-                f"95% Response Head Latency: {np.percentile(head_latencies, 95)}"
-            )
-            print(
-                f"99% Response Head Latency: {np.percentile(head_latencies, 99)}"
-            )
-
-        latency_size = sum(len(i) for i in self.response_latency_bucket.values())
-        if latency_size:
-            latencies = [j for i in self.response_latency_bucket.values() for j in i]
-            print(
-                f"Average Response Latency: {sum(latencies) / latency_size}"
-            )
-            print(
-                f"Median Response Latency: {np.percentile(latencies, 50)}"
-            )
-            print(
-                f"95% Response Latency: {np.percentile(latencies, 95)}"
-            )
-            print(
-                f"99% Response Latency: {np.percentile(latencies, 99)}"
-            )
-
-        print(
-            f"Average Response Tokens/s: {sum(self.response_word_bucket.values()) / (time.time() - self.start_time)}"
-        )
-        print(
-            f"Average Input Tokens/s: {sum(self.input_word_bucket.values()) / (time.time() - self.start_time)}"
-        )
+        print_aggregations(data_to_pickle)
 
 
 def linear_regression(x, y):
@@ -164,7 +291,7 @@ class UserSpawner:
 
         self.data_collector = collector
         self.user_def = user_def
-
+        self.current_id = -1
         self.user_list: list[Task] = []
 
     async def sync(self):
@@ -177,50 +304,60 @@ class UserSpawner:
     def current_user_count(self):
         return len(self.user_list)
 
-    async def user_loop(self):
+    async def user_loop(self, user_id=0):
         with self.data_collector.collect_user():
             cookie_jar = aiohttp.DummyCookieJar()
             try:
                 async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
                     while True:
                         url, headers, data, input_data = self.user_def.make_request()
-                        self.data_collector.total_requests += 1
-                        with self.data_collector.collect_http_request():
+                        time_key = math.floor(time.time())
+                        with self.data_collector.collect_http_request(
+                            user_id, time_key
+                        ):
                             req_start = time.time()
                             async with session.post(
                                 url,
                                 headers=headers,
                                 data=data,
                             ) as response:
-                                self.data_collector.collect_response_status(
-                                    response.status
-                                )
                                 try:
                                     if response.status != 200:
                                         continue
 
                                     first = True
+                                    result = []
                                     async for data, end_of_http_chunk in response.content.iter_chunks():
-                                        result = self.user_def.parse_response(data)
+                                        result += self.user_def.parse_response(data)
                                         if first:
                                             first = False
                                             self.data_collector.collect_response_head_latency(
-                                                time.time() - req_start
+                                                time.time() - req_start,
+                                                user_id,
+                                                time_key,
                                             )
-                                        self.data_collector.collect_response_chunk(
-                                            result, input_data['input_tokens']
-                                        )
                                         if not end_of_http_chunk:
                                             break
+                                    self.data_collector.collect_response_chunk(
+                                        result,
+                                        input_data["input_tokens"],
+                                        user_id,
+                                        time_key,
+                                    )
                                 except Exception as e:
                                     self.data_collector.collect_response_status(str(e))
                                     raise e
+
                         await self.user_def.rest()
+                        self.data_collector.total_requests += 1
+                        self.data_collector.collect_response_status(response.status)
             except asyncio.CancelledError:
                 pass
 
     def spawn_user(self):
-        self.user_list.append(asyncio.create_task(self.user_loop()))
+        user_id = self.current_id + 1
+        self.user_list.append(asyncio.create_task(self.user_loop(user_id)))
+        self.current_id = self.current_id + 1
 
     async def cancel_all_users(self):
         try:
@@ -294,7 +431,7 @@ class UserSpawner:
             return 0
 
 
-async def start_benchmark_session(args, user_def):
+async def start_benchmark_session(args, user_def, logger=print):
     # ping server
     response_times = []
     async with aiohttp.ClientSession() as session:
@@ -311,13 +448,12 @@ async def start_benchmark_session(args, user_def):
             await asyncio.sleep(0.3)
     ping_latency = sum(response_times) / len(response_times)
     print(f"Ping latency: {ping_latency}. ping correction: {args.ping_correction}")
-
     # init
     collector = MetricsCollector(
-        user_def, args.session_time, ping_latency - 0.005 if args.ping_correction else 0
+        user_def, logger, args.session_time, ping_latency if args.ping_correction else 0
     )
     user_spawner = UserSpawner(
-        user_def, collector, args.max_users, target_time=time.time() + 20
+        user_def, collector, args.max_users, target_time=time.time() + 0.1
     )
     asyncio.create_task(user_spawner.spawner_loop())
     asyncio.create_task(collector.report_loop())

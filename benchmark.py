@@ -1,17 +1,18 @@
+import os
 import argparse
 import functools
-import os
-
+import multiprocessing
+from collections import defaultdict
 from transformers import AutoTokenizer
-
 from userdef import UserDef as BaseUserDef
+from collections import defaultdict
 
 try:
-    max_tokens = int(os.environ.get("MAX_TOKENS"))
+    MAX_TOKENS = int(os.environ.get("MAX_TOKENS"))
 except (TypeError, ValueError):
-    max_tokens = 512
+    MAX_TOKENS = 512
 
-print(f"max_tokens set to {max_tokens}")
+print(f"max_tokens set to {MAX_TOKENS}")
 
 MODEL = os.environ.get("MODEL", "NousResearch/Meta-Llama-3.1-8B-Instruct")
 tokenizer = AutoTokenizer.from_pretrained(MODEL)
@@ -62,15 +63,15 @@ def get_prompt_set(min_input_length=0, max_input_length=500):
         d["output_tokens"] = len(tokenizer(d["response"]))
     system_prompt_len = len(tokenizer(system_prompt)["input_ids"])
     return [
-        {'prompt': d["question"], 'input_tokens': system_prompt_len + d["input_tokens"]}
+        {"prompt": d["question"], "input_tokens": system_prompt_len + d["input_tokens"]}
         for d in dataset
         if min_input_length <= d["input_tokens"] <= max_input_length
     ]
 
-prompts = get_prompt_set(30, 500)
+prompts = get_prompt_set(200, 1000)
 
 
-class UserDef(BaseUserDef):
+class OpenAIChatStreaming(BaseUserDef):
     BASE_URL = base_url
     PROMPTS = prompts
 
@@ -80,27 +81,104 @@ class UserDef(BaseUserDef):
         import random
 
         prompt = random.choice(cls.PROMPTS)
-        headers = {
-            'accept': 'application/json',
-            'content-type': 'application/json'
-        }
+        headers = {"accept": "application/json", "content-type": "application/json"}
         url = f"{cls.BASE_URL}/v1/chat/completions"
         data = {
-            "model": MODEL.lower().replace('/', '-').replace('.', '-'),
+            "model": MODEL.lower().replace("/", "-").replace(".", "-"),
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt['prompt']}
+                {"role": "user", "content": prompt["prompt"]},
             ],
-            "max_tokens": max_tokens
+            "max_tokens": MAX_TOKENS,
+            "stream": True,
         }
         return url, headers, json.dumps(data), prompt
 
     @staticmethod
     def parse_response(chunk: bytes):
         import json
+
         data = chunk.decode("utf-8").strip()
-        text = json.loads(data)["choices"][0]['message']['content']
-        return tokenizer.encode(text, add_special_tokens=False)
+        output = []
+        for line in data.split("\n"):
+            if line.strip():
+                if len(line.split(":", 1)) == 2:
+                    line = line.split(":", 1)[1].strip()
+                    if line == "[DONE]":
+                        continue
+                    try:
+                        text = json.loads(line)["choices"][0]["delta"]["content"]
+                        output += tokenizer.encode(text, add_special_tokens=False)
+                    except Exception as e:
+                        print(line)
+                        print(e)
+                        continue
+                else:
+                    print(line)
+        return output
+
+# Global queue to communicate with the logging process
+log_queue = None
+log_process = None
+
+# Function to process log entries in the background
+def log_worker(queue, filename="log.csv"):
+    """Background worker that writes log entries to the CSV file."""
+    log_data = defaultdict(dict)
+
+    while True:
+        # Get the log entry from the queue
+        string = queue.get()
+
+        # If we receive the 'STOP' signal, exit the loop
+        if string == "STOP":
+            if log_data:  # Write any remaining data before exiting
+                write_to_json(log_data, filename)
+            break
+
+        split_string = string.split(":", 1)
+
+        if len(split_string) == 2:
+            key, value = split_string
+            key, value = key.strip(), value.strip()  # Removing extra spaces
+            if key == "Time":
+                if log_data:  # Write the previous group before resetting
+                    write_to_json(log_data, filename)
+                log_data.clear()  # Clear for the new group of key-value pairs
+
+            log_data[key] = value
+
+
+def write_to_json(data, filename):
+    """Write the collected key-value pairs as a row in a JOSNL file."""
+    import json
+    with open(filename, "a") as jsonfile:
+        json.dump(data, jsonfile)
+        jsonfile.write("\n")
+
+
+# Function to log messages by adding them to the global queue
+def logger(string):
+    """Put log messages into the global queue."""
+    log_queue.put(string)
+    print(string)
+
+
+# Start the logging process with a global queue and process
+def start_logging_process(filename="log.jsonl"):
+    """Start the background logging process using a global queue."""
+    global log_queue, log_process
+    log_queue = multiprocessing.Queue()
+    log_process = multiprocessing.Process(target=log_worker, args=(log_queue, filename))
+    log_process.start()
+
+
+# Stop the logging process gracefully
+def stop_logging_process():
+    """Stop the background logging process gracefully."""
+    global log_queue, log_process
+    log_queue.put("STOP")  # Signal the worker to stop
+    log_process.join()  # Wait for the worker to finish
 
 
 if __name__ == "__main__":
@@ -113,5 +191,8 @@ if __name__ == "__main__":
     parser.add_argument("--session_time", type=float, default=None)
     parser.add_argument("--ping_correction", action="store_true")
     args = parser.parse_args()
-
-    asyncio.run(start_benchmark_session(args, UserDef))
+    # Start the logging process
+    start_logging_process()
+    asyncio.run(start_benchmark_session(args, OpenAIChatStreaming, logger=logger))
+    # Stop the logging process
+    stop_logging_process()
