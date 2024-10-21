@@ -22,8 +22,9 @@ except (TypeError, ValueError):
 
 print(f"max_tokens set to {MAX_TOKENS}")
 
-MODEL = os.environ.get("MODEL", "NousResearch/Meta-Llama-3.1-8B-Instruct")
-tokenizer = AutoTokenizer.from_pretrained(MODEL)
+MODEL = os.environ.get("MODEL", "nousresearch-meta-llama-3-1-8b-instruct")
+MODEL_HF = os.environ.get("MODEL_HF", "NousResearch/Meta-Llama-3.1-8B-Instruct")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_HF)
 
 default_system_prompt = """You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.
 
@@ -99,6 +100,8 @@ class OpenAIChatStreaming(BaseUserDef):
             "max_tokens": MAX_TOKENS,
             "stream": True,
         }
+        if len(MODEL) > 2:
+            data['model'] = MODEL
         return url, headers, json.dumps(data), prompt
 
     @staticmethod
