@@ -13,6 +13,7 @@ import functools
 class MetricsCollector:
     def __init__(self, user_def, session_time=None, ping_latency=0.0):
         self.start_time = math.floor(time.time())
+        self.input_word_bucket = collections.defaultdict(int)
         self.response_word_bucket = collections.defaultdict(int)
         self.response_head_latency_bucket = collections.defaultdict(list)
         self.response_latency_bucket = collections.defaultdict(list)
@@ -25,8 +26,9 @@ class MetricsCollector:
         self.session_time = session_time
         self.ping_latency = ping_latency
 
-    def collect_response_chunk(self, chunk: list):
+    def collect_response_chunk(self, chunk: list, input_tokens: int = 0):
         self.response_word_bucket[math.floor(time.time())] += len(chunk)
+        self.input_word_bucket[math.floor(time.time())] += input_tokens
 
     def collect_response_status(self, status):
         self.status_bucket[status] += 1
@@ -84,6 +86,9 @@ class MetricsCollector:
             print(
                 f"Response Tokens/s: {sum(self.response_word_bucket[i] for i in range(now - time_window, now)) / time_window}"
             )
+            print(
+                f"Input Tokens/s: {sum(self.input_word_bucket[i] for i in range(now - time_window, now)) / time_window}"
+            )
             print(f"Status: {self.status_bucket}")
             print()
 
@@ -134,6 +139,9 @@ class MetricsCollector:
         print(
             f"Average Response Tokens/s: {sum(self.response_word_bucket.values()) / (time.time() - self.start_time)}"
         )
+        print(
+            f"Average Input Tokens/s: {sum(self.input_word_bucket.values()) / (time.time() - self.start_time)}"
+        )
 
 
 def linear_regression(x, y):
@@ -175,7 +183,7 @@ class UserSpawner:
             try:
                 async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
                     while True:
-                        url, headers, data = self.user_def.make_request()
+                        url, headers, data, input_data = self.user_def.make_request()
                         self.data_collector.total_requests += 1
                         with self.data_collector.collect_http_request():
                             req_start = time.time()
@@ -199,9 +207,8 @@ class UserSpawner:
                                             self.data_collector.collect_response_head_latency(
                                                 time.time() - req_start
                                             )
-
                                         self.data_collector.collect_response_chunk(
-                                            result
+                                            result, input_data['input_tokens']
                                         )
                                         if not end_of_http_chunk:
                                             break
@@ -292,6 +299,7 @@ async def start_benchmark_session(args, user_def):
     response_times = []
     async with aiohttp.ClientSession() as session:
         async with session.get(user_def.ping_url()) as response:
+            print(response.status)
             assert response.status in [200, 404]
         await asyncio.sleep(0.3)
 
@@ -323,50 +331,3 @@ async def start_benchmark_session(args, user_def):
 
     await user_spawner.cancel_all_users()
     return 0
-
-
-@functools.lru_cache(maxsize=1)
-def get_tokenizer():
-    from transformers import LlamaTokenizer
-
-    tokenizer = LlamaTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
-
-    def _tokenizer(text):
-        return tokenizer(text)["input_ids"][1:]
-
-    return _tokenizer
-
-
-@functools.lru_cache(maxsize=8)
-def get_prompt_set(min_input_length=0, max_input_length=500):
-    """
-    return a list of prompts with length between min_input_length and max_input_length
-    """
-    import json
-    import requests
-    import os
-
-    # check if the dataset is cached
-    if os.path.exists("databricks-dolly-15k.jsonl"):
-        print("Loading cached dataset")
-        with open("databricks-dolly-15k.jsonl", "r") as f:
-            dataset = [json.loads(line) for line in f.readlines()]
-    else:
-        print("Downloading dataset")
-        raw_dataset = requests.get(
-            "https://huggingface.co/datasets/databricks/databricks-dolly-15k/resolve/main/databricks-dolly-15k.jsonl"
-        )
-        content = raw_dataset.content
-        open("databricks-dolly-15k.jsonl", "wb").write(content)
-        dataset = [json.loads(line) for line in content.decode().split("\n")]
-        print("Dataset downloaded")
-
-    tokenizer = get_tokenizer()
-    for d in dataset:
-        d["input_tokens"] = len(tokenizer(d["instruction"]))
-        d["output_tokens"] = len(tokenizer(d["response"]))
-    return [
-        d["instruction"]
-        for d in dataset
-        if min_input_length <= d["input_tokens"] <= max_input_length
-    ]

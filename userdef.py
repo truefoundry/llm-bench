@@ -5,7 +5,7 @@ class UserDef:
 
     @classmethod
     def ping_url(cls):
-        return f"{cls.BASE_URL}/healthz"
+        return f"{cls.BASE_URL}/health"
 
     @staticmethod
     async def rest():

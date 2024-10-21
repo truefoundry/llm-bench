@@ -60,13 +60,14 @@ def get_prompt_set(min_input_length=0, max_input_length=500):
         d["question"] = d["context"] + d["instruction"]
         d["input_tokens"] = len(tokenizer(d["question"])["input_ids"])
         d["output_tokens"] = len(tokenizer(d["response"]))
+    system_prompt_len = len(tokenizer(system_prompt)["input_ids"])
     return [
-        d["question"]
+        {'prompt': d["question"], 'input_tokens': system_prompt_len + d["input_tokens"]}
         for d in dataset
         if min_input_length <= d["input_tokens"] <= max_input_length
     ]
 
-prompts = get_prompt_set(30, 150)
+prompts = get_prompt_set(30, 500)
 
 
 class UserDef(BaseUserDef):
@@ -79,17 +80,20 @@ class UserDef(BaseUserDef):
         import random
 
         prompt = random.choice(cls.PROMPTS)
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            'accept': 'application/json',
+            'content-type': 'application/json'
+        }
         url = f"{cls.BASE_URL}/v1/chat/completions"
         data = {
-            "model": MODEL,
+            "model": MODEL.lower().replace('/', '-').replace('.', '-'),
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt['prompt']}
             ],
             "max_tokens": max_tokens
         }
-        return url, headers, json.dumps(data)
+        return url, headers, json.dumps(data), prompt
 
     @staticmethod
     def parse_response(chunk: bytes):
