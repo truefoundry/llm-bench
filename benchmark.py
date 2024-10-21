@@ -6,6 +6,14 @@ from collections import defaultdict
 from transformers import AutoTokenizer
 from userdef import UserDef as BaseUserDef
 from collections import defaultdict
+from truefoundry.ml import get_client, ArtifactPath
+
+
+TFY_ML_REPO = os.environ.get("TFY_ML_REPO")
+RUN_NAME = 'test'
+
+client = get_client()
+run = client.create_run(ml_repo=TFY_ML_REPO, run_name=RUN_NAME)
 
 try:
     MAX_TOKENS = int(os.environ.get("MAX_TOKENS"))
@@ -141,9 +149,14 @@ def log_worker(queue, filename="log.csv"):
         if len(split_string) == 2:
             key, value = split_string
             key, value = key.strip(), value.strip()  # Removing extra spaces
+            value = eval(value)
             if key == "Time":
                 if log_data:  # Write the previous group before resetting
                     write_to_json(log_data, filename)
+                    run.log_metrics({
+                            k.lower().replace(' ', '_').replace('.', '_').replace('(', '_').replace(')', '_').replace('/', ' per '): v 
+                               for k,v in log_data.items() if isinstance(v, float) or isinstance(v, int)
+                        }, step=int(value))
                 log_data.clear()  # Clear for the new group of key-value pairs
 
             log_data[key] = value
@@ -196,3 +209,15 @@ if __name__ == "__main__":
     asyncio.run(start_benchmark_session(args, OpenAIChatStreaming, logger=logger))
     # Stop the logging process
     stop_logging_process()
+    artifact_version = client.log_artifact(
+        ml_repo=TFY_ML_REPO,
+        name="results",
+        artifact_paths=[
+            ArtifactPath(src="log.jsonl"),
+            ArtifactPath(src="final_report.pkl"),
+        ],
+        description="Output of llm-perf",
+    )
+    print(artifact_version.fqn)
+    run.end()
+    

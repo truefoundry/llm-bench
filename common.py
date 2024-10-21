@@ -10,7 +10,7 @@ import contextlib
 import math
 
 
-def print_aggregations(d):
+def print_aggregations(d, logger):
     end_time = max([t for u, t in d["response_bucket"]])
     total_time = end_time - d["start_time"]
     print("Total Time:", total_time)
@@ -20,7 +20,7 @@ def print_aggregations(d):
     total_requests = sum(d["response_bucket"].values())
 
     # Calculate average requests per second
-    avg_requests_per_second = total_requests / total_time
+    avg_requests_per_second = total_requests / total_time if total_time > 0 else 0
 
     # Prepare data for quantile calculations
     head_latencies = [
@@ -57,7 +57,7 @@ def print_aggregations(d):
         avg_output_tokens_per_second_per_user[user] = sum(output_tokens_per_second_per_user[user])/len(output_tokens_per_second_per_user[user])
 
     # Calculate total tokens per second (for all users)
-    total_output_tokens_per_second = total_output_tokens / total_time
+    total_output_tokens_per_second = total_output_tokens / total_time if total_time > 0 else 0
     total_input_tokens_per_second = sum(avg_input_tokens_per_second_per_user.values())
 
     # Calculate input/output tokens per request (user)
@@ -87,44 +87,38 @@ def print_aggregations(d):
     quantiles = [0, 50, 90, 95, 99, 100]
 
     # Print aggregations
-    print(f"Total requests: {total_requests}")
-    print(f"Average Request/s: {avg_requests_per_second:.2f}")
+    logger(f"Total requests: {total_requests}")
+    logger(f"Average Request/s: {avg_requests_per_second:.2f}")
 
-    print("\nResponse Time to first token (head_latency):")
     for q in quantiles:
         value = np.percentile(head_latencies, q)
-        print(f"  q{q}: {value:.2f}s")
+        logger(f"Response Time to first token (head_latency) q{q}: {value:.2f}")
 
-    print("\nResponse Time:")
     for q in quantiles:
         value = np.percentile(response_times, q)
-        print(f"  q{q}: {value:.2f}s")
+        logger(f"Response Time q{q}: {value:.2f}")
 
-    print("\nOutput Tokens/s per user:")
     for q in quantiles:
         value = np.percentile(list(avg_output_tokens_per_second_per_user.values()), q)
-        print(f"  q{q}: {value:.2f}")
+        logger(f"Output Tokens/s per user q{q}: {value:.2f}")
 
-    print("\nInput Tokens/s per user:")
     for q in quantiles:
         value = np.percentile(list(avg_input_tokens_per_second_per_user.values()), q)
-        print(f"  q{q}: {value:.2f}")
+        logger(f"Input Tokens/s per user q{q}: {value:.2f}")
 
-    print(f"\nTotal Output Tokens/s (all users): {total_output_tokens_per_second:.2f}")
-    print(f"Total Input Tokens/s (all users): {total_input_tokens_per_second:.2f}")
+    logger(f"Total Output Tokens/s (all users): {total_output_tokens_per_second:.2f}")
+    logger(f"Total Input Tokens/s (all users): {total_input_tokens_per_second:.2f}")
 
-    print("\nInput Tokens per request:")
     for q in quantiles:
         value = np.percentile(input_tokens_per_request_flat, q)
-        print(f"  q{q}: {value:.2f}")
+        logger(f"Input Tokens per request q{q}: {value:.2f}")
 
-    print("\nOutput Tokens per request:")
     for q in quantiles:
         value = np.percentile(output_tokens_per_request_flat, q)
-        print(f"  q{q}: {value:.2f}")
+        logger(f"Output Tokens per request q{q}: {value:.2f}")
 
-    print(f"\nTotal Output Tokens: {total_output_tokens}")
-    print(f"Total Input Tokens: {total_input_tokens}")
+    logger(f"Total Output Tokens: {total_output_tokens}")
+    logger(f"Total Input Tokens: {total_input_tokens}")
 
 
 class MetricsCollector:
@@ -180,72 +174,32 @@ class MetricsCollector:
         yield
         self.on_going_users -= 1
 
-    async def report_loop(self, time_window=60, report_time_window=5):
+    async def report_loop(self, report_time_window=30):
         """
         Each bucket is in 1s. This function will report the avg metrics in the past time_window seconds.
         """
         while True:
             await asyncio.sleep(report_time_window)
             now = math.floor(time.time())
-
-            # Calculate average latency for requests in the time window
-            latencies = []
-            for (
-                user_id,
-                time_key,
-            ), latency_list in self.response_latency_bucket.items():
-                if time_key >= now - time_window:
-                    latencies.extend(latency_list)
-
-            avg_latency = np.mean(latencies) if latencies else 0  # Average latency
-
-            # Calculate metrics for the time window
-            requests_last_window = sum(
-                self.response_bucket[key]
-                for key in self.response_bucket.keys()
-                if key[1] >= now - time_window - avg_latency
-            )
-            total_input_tokens_last_window = sum(
-                self.input_word_bucket[key]
-                for key in self.input_word_bucket.keys()
-                if key[1] >= now - time_window - avg_latency
-            )
-            total_output_tokens_last_window = sum(
-                self.response_word_bucket[key]
-                for key in self.response_word_bucket.keys()
-                if key[1] >= now - time_window - avg_latency
-            )
-
-            avg_requests_per_sec = (
-                requests_last_window / min(time_window, now - self.start_time)
-                if min(time_window, now - self.start_time) > 0
-                else 0
-            )
-            avg_output_tokens_per_sec = (
-                total_output_tokens_last_window
-                / min(time_window, now - self.start_time)
-                if min(time_window, now - self.start_time) > 0
-                else 0
-            )
-
             # Log the metrics
             self.logging_function(f"Time: {now - self.start_time}")
-            self.logging_function(f"Active Users: {self.on_going_users}")
-            self.logging_function(f"Total Requests: {self.total_requests}")
-            self.logging_function(f"Active Requests: {self.on_going_requests}")
-            self.logging_function(f"Status: {dict(self.status_bucket)}")
-            self.logging_function(
-                f"Avg Latency (last {time_window} sec): {avg_latency:.3f}"
-            )
-            self.logging_function(
-                f"Avg Requests/s (last {time_window} sec): {avg_requests_per_sec:.3f}"
-            )
-            self.logging_function(
-                f"Avg Output Tokens/s (last {time_window} sec): {avg_output_tokens_per_sec:.3f}"
-            )
+            print_aggregations({
+                "start_time": self.start_time,
+                "input_word_bucket": self.input_word_bucket,
+                "response_word_bucket": self.response_word_bucket,
+                "response_head_latency_bucket": self.response_head_latency_bucket,
+                "response_latency_bucket": self.response_latency_bucket,
+                "requests_through_time_bucket": self.requests_through_time_bucket,
+                "response_bucket": self.response_bucket,
+                "total_requests": self.total_requests,
+                "status_bucket": self.status_bucket,
+                "max_users": self.max_users,
+                "ping_latency": self.ping_latency,
+            }, self.logging_function)
             self.logging_function("")
 
             if self.session_time and now - self.start_time >= self.session_time:
+                self.logging_function(f"Time: {1 + now - self.start_time}")
                 self.report_final()
                 break
 
@@ -267,7 +221,7 @@ class MetricsCollector:
             pickle.dump(data_to_pickle, f)
 
         print("=================== Final Report ====================")
-        print_aggregations(data_to_pickle)
+        print_aggregations(data_to_pickle, self.logging_function)
 
 
 def linear_regression(x, y):
